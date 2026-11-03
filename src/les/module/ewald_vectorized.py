@@ -84,6 +84,16 @@ class Ewald_vectorized(nn.Module):
         else:
             batch = batch.to(device=r.device, dtype=torch.long)
 
+        if e_ext is not None:
+            if e_ext.dim() == 1:
+                if e_ext.shape[0] != 3:
+                    raise ValueError('e_ext must have shape [3] or [batch_size, 3]')
+            elif e_ext.dim() == 2:
+                n_graphs = cell.shape[0] if (cell is not None and cell.dim() == 3) else (int(batch.max().item()) + 1 if batch.numel() > 0 else 0)
+                if e_ext.shape[0] != n_graphs or e_ext.shape[1] != 3:
+                    raise ValueError('e_ext must have shape [3] or [batch_size, 3]')
+            else:
+                raise ValueError('e_ext must have shape [3] or [batch_size, 3]')
 
         if u is not None:
             if u.dim() == 2 and u.shape[1] == 3:
@@ -94,6 +104,7 @@ class Ewald_vectorized(nn.Module):
             if quad.dim() == 3 and quad.shape[1] == 3:
                 quad = quad.unsqueeze(1)  # [n_atoms, 3, 3] -> [n_atoms, 1, 3, 3]
             assert quad.shape == (n, q.shape[1], 3, 3), 'quad dimension error, expected [n_atoms, n_q, 3, 3]'
+            quad = 0.5 * (quad + quad.transpose(-1, -2))
 
         if not self.is_periodic: # non-periodic
             assert cell is not None, 'fake cell needed for non-periodic case (ex. torch.zeros(n_batch, 3,3))'
@@ -114,9 +125,16 @@ class Ewald_vectorized(nn.Module):
         assert kappa.dim() == 2, 'kappa dimension error'
         return - kappa.to(dtype=e_phi.dtype) * e_phi  # [N, n_q]
 
-    def _get_induced_u(self, e_field, alpha, e_ext: Optional[torch.Tensor] = None):
+    def _get_induced_u(self, e_field, alpha, e_ext: Optional[torch.Tensor] = None, batch: Optional[torch.Tensor] = None):
         if e_ext is not None:
-            e_field = e_field + e_ext.to(dtype=e_field.dtype)[None, None, :]
+            e_ext_t = e_ext.to(dtype=e_field.dtype, device=e_field.device)
+            if e_ext_t.dim() == 1:
+                e_field = e_field + e_ext_t[None, None, :]
+            elif e_ext_t.dim() == 2:
+                assert batch is not None, 'batch is required for 2D e_ext'
+                e_field = e_field + e_ext_t[batch][:, None, :]
+            else:
+                raise ValueError('e_ext must have shape [3] or [batch_size, 3]')
         alpha = alpha.to(dtype=e_field.dtype)
         if alpha.dim() == 1 or (alpha.dim() == 3 and alpha.shape[1:3] == (3, 3)):
             alpha = alpha.unsqueeze(1)
@@ -250,7 +268,7 @@ class Ewald_vectorized(nn.Module):
                 pot_per_batch = pot_per_batch + 0.5 * (
                     onehot @ (e_phi * q_induced)).sum(dim=1) / self.norm_factor
             if alpha is not None:
-                u_induced = self._get_induced_u(e_field, alpha, e_ext)
+                u_induced = self._get_induced_u(e_field, alpha, e_ext, batch=batch)
                 pot_per_batch = pot_per_batch - 0.5 * (
                     onehot @ (e_field * u_induced).sum(dim=-1)).sum(dim=1) / self.norm_factor
 
@@ -283,7 +301,7 @@ class Ewald_vectorized(nn.Module):
         cell_inv = torch.linalg.inv(cell) # [B, 3, 3]
         G = 2 * torch.pi * cell_inv.transpose(-2, -1)  # [B, 3, 3], G = 2\pi(M^{-1}).T
 
-        volume = torch.det(cell)  # [B]
+        volume = torch.abs(torch.det(cell))  # [B]
         if alpha is not None and self.use_epsilon_r_scaling:
             epsilon_r = self._get_epsilon_r(alpha, volume, batch, B, n_q)  # [B, n_q]
         else:
@@ -412,7 +430,7 @@ class Ewald_vectorized(nn.Module):
                     e_field = e_field + c_self * u
 
                 if alpha is not None:
-                    u_induced = self._get_induced_u(e_field, alpha, e_ext)
+                    u_induced = self._get_induced_u(e_field, alpha, e_ext, batch=batch)
                     induced_u_per_batch = onehot @ (e_field * u_induced).sum(dim=-1)  # [B, n_q]
                     pot_per_batch_per_q = pot_per_batch_per_q - 0.5 * induced_u_per_batch / self.norm_factor
 

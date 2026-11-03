@@ -8,9 +8,12 @@ for adding LES to your own model. For already implemented MLIPs with LES, please
 ## Install
 
 ```bash
-git clone https://github.com/ChengUCB/les.git
-cd les && pip install -e .
+git clone https://github.com/ListeningPost1379/les-pme.git
+cd les-pme
+python -m pip install -e '.[yaml]'
 ```
+
+For the fork-specific solver, mesh and precision settings, see the [solver overview](../README.md) and [PME guide](pme_training.md).
 
 ## The module
 

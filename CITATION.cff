@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: >-
+  Please cite this software release for the LES-PME extensions and the
+  upstream LES method paper listed in references for the underlying method.
+type: software
+title: "LES-PME: Trainable blocked and particle-mesh Ewald extensions to LES"
+authors:
+  - family-names: Cao
+    given-names: Dehan
+    email: caodehan@gmail.com
+version: 0.2.0+lespme.1
+date-released: 2026-11-03
+repository-code: https://github.com/ListeningPost1379/les-pme
+license: CC-BY-NC-4.0
+abstract: >-
+  PyTorch extensions to Latent Ewald Summation with exact blocked
+  recomputation, particle-mesh Ewald, multipoles and single induced
+  responses, including force-loss double backward. Derived from
+  ChengUCB/les at 35b971a650cf30adb84fef7138761e81aa47b3a2.
+references:
+  - type: article
+    title: "Latent Ewald summation for machine learning of long-range interactions"
+    authors:
+      - family-names: Cheng
+        given-names: Bingqing
+    journal: npj Computational Materials
+    year: 2025
+    volume: 11
+    start: 80
+    doi: 10.1038/s41524-025-01577-7

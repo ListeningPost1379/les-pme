@@ -1,5 +1,5 @@
-LES
-===
+LES-PME
+=======
 
 **Latent Ewald Summation** adds long-range electrostatics to a short-range machine learning
 interatomic potential, learning it from ordinary energy and force data alone. The network
@@ -10,7 +10,7 @@ Nothing supervises those charges. They come out physically meaningful all the sa
 trained on energies and forces predict dipoles, Born effective charges, IR and Raman spectra,
 and dielectric response.
 
-`les <https://github.com/ChengUCB/les>`_ is a plug-in library, already integrated into several
+`LES-PME <https://github.com/ListeningPost1379/les-pme>`_ extends the upstream LES plug-in library, already integrated into several
 MLIPs. Pick yours below; each page shows the training script and explains the options.
 
 .. toctree::
@@ -24,6 +24,9 @@ MLIPs. Pick yours below; each page shows the training script and explains the op
    :caption: Using LES
 
    library
+   design
+   pme_training
+   testing
    mace
    cace
    nequip

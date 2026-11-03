@@ -172,3 +172,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local development notes and host artifacts
+PROJECT.md
+AGENTS.md
+work/
+docs/superpowers/
+.DS_Store
+
+# Reference environment documented in docs/testing.md
+.venv-reference/

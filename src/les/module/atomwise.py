@@ -49,7 +49,7 @@ class Atomwise(nn.Module):
 
     def forward(self, 
                 desc: torch.Tensor, # [n_atoms, n_features]
-                batch: torch.Tensor, # [n_atoms]
+                batch: Optional[torch.Tensor] = None, # [n_atoms]
                 training: bool = None,
                ) -> torch.Tensor:
 
@@ -67,7 +67,7 @@ class Atomwise(nn.Module):
                 activation=self.activation,
                 bias=self.bias,
                 )
-            self.outnet = self.outnet.to(desc.device)
+            self.outnet = self.outnet.to(device=desc.device, dtype=desc.dtype)
             if self.add_linear_nn:
                 self.linear_nn = Dense(
                    self.n_in,
@@ -75,9 +75,13 @@ class Atomwise(nn.Module):
                    bias=self.bias,
                    activation=None,
                    )
-                self.linear_nn = self.linear_nn.to(desc.device)
+                self.linear_nn = self.linear_nn.to(device=desc.device, dtype=desc.dtype)
             else:
                 self.linear_nn = None
+        else:
+            self.outnet = self.outnet.to(device=desc.device, dtype=desc.dtype)
+            if self.add_linear_nn and self.linear_nn is not None:
+                self.linear_nn = self.linear_nn.to(device=desc.device, dtype=desc.dtype)
 
         # predict atomwise contributions
         y = self.outnet(desc)

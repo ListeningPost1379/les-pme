@@ -2,10 +2,13 @@ import torch
 from torch import nn
 from typing import Dict, Any, Union, Optional
 
+from .module.blocked import DEFAULT_DENSE_PAIRS
+
 from .module import (
     Atomwise,
     Ewald,
     Ewald_vectorized,
+    PME,
     BEC,
     FixedCharges,
     AtomicAlpha,
@@ -47,7 +50,29 @@ class Les(nn.Module):
         if self.use_atomic_alpha:
             self.atomic_alpha = AtomicAlpha()
 
-        if self.is_periodic is not None:
+        reciprocal_solver = les_arguments.get('reciprocal_solver', 'direct')
+        if reciprocal_solver not in ('direct', 'original', 'blocked', 'pme'):
+            raise ValueError("reciprocal_solver must be 'direct', 'original', 'blocked' or 'pme'")
+        compute_dtype = les_arguments.get('compute_dtype', 'auto')
+        if compute_dtype not in ('auto', 'float32', 'float64'):
+            raise ValueError("compute_dtype must be 'auto', 'float32' or 'float64'")
+        if (compute_dtype != 'auto' or reciprocal_solver in ('original', 'blocked', 'pme')) and les_arguments.get('reciprocal_mode', 'legacy') not in ('legacy', 'upstream'):
+            raise ValueError('Explicit solver/precision selection requires the legacy reciprocal kernel')
+        if reciprocal_solver != 'pme' and any(key in les_arguments for key in ('pme_mesh', 'pme_cutoff_dtype')):
+            raise ValueError('PME options require reciprocal_solver=pme')
+        dense_pairs = les_arguments.get('dense_pairs', DEFAULT_DENSE_PAIRS)
+        if reciprocal_solver == 'pme':
+            if self.is_periodic is not None or les_arguments.get('reciprocal_mode', 'legacy') not in ('legacy', 'upstream'):
+                raise ValueError('PME requires automatic boundaries and the legacy reciprocal kernel')
+            self.ewald = PME(mesh=les_arguments.get('pme_mesh', 'auto'), sigma=self.sigma,
+                             dl=self.dl, remove_self_interaction=self.remove_self_interaction,
+                             compute_dtype=compute_dtype,
+                             pme_cutoff_dtype=les_arguments.get('pme_cutoff_dtype', 'float64'),
+                             dense_pairs=dense_pairs,
+                             use_epsilon_r_scaling=self.use_epsilon_r_scaling)
+        elif self.is_periodic is not None:
+            if compute_dtype != 'auto' or reciprocal_solver == 'blocked':
+                raise ValueError('Explicit precision and blocked require automatic boundaries (is_periodic=None)')
             self.ewald = Ewald_vectorized( # torch.compile compatible
                 sigma=self.sigma, # default 1.0
                 dl=self.dl, # default 2.0
@@ -56,12 +81,16 @@ class Les(nn.Module):
                 remove_self_interaction=self.remove_self_interaction,
                 use_epsilon_r_scaling=self.use_epsilon_r_scaling,
                 )
+            self.ewald.reciprocal_solver = reciprocal_solver
         else:
             self.ewald = Ewald( # legacy module, not torch.compile compatible, supports mixed datasets
                 sigma=self.sigma,
                 dl=self.dl,
                 remove_self_interaction=self.remove_self_interaction,
                 use_epsilon_r_scaling=self.use_epsilon_r_scaling,
+                reciprocal_solver=reciprocal_solver,
+                compute_dtype=compute_dtype,
+                dense_pairs=dense_pairs,
                 )
 
         self.bec = BEC(
@@ -141,15 +170,23 @@ class Les(nn.Module):
             raise ValueError("Either desc or latent_charges must be provided")
 
         if atomic_numbers is not None and self.use_fixed_atomic_charges:
-            latent_charges = latent_charges + self.fixed_charges(atomic_numbers)
+            fixed_q = self.fixed_charges(atomic_numbers).to(dtype=latent_charges.dtype)
+            if latent_charges.dim() == 2:
+                fixed_q = fixed_q.unsqueeze(1)
+            latent_charges = latent_charges + fixed_q
 
         if atomic_numbers is not None and self.use_atomic_alpha and latent_alphas is not None:
-            baseline_alphas = self.atomic_alpha(atomic_numbers)
-            #print(f'baseline_alphas: {baseline_alphas}')
+            baseline_alphas = self.atomic_alpha(atomic_numbers).to(dtype=latent_alphas.dtype)
             if latent_alphas.dim() == 1:
                 latent_alphas = latent_alphas + baseline_alphas
+            elif latent_alphas.dim() == 2:
+                latent_alphas = latent_alphas + baseline_alphas.unsqueeze(1)
             elif latent_alphas.dim() == 3:
-                latent_alphas = latent_alphas + baseline_alphas[:,None,None] * torch.eye(3, device=baseline_alphas.device).unsqueeze(0) # [n_atoms, 3, 3]
+                eye = torch.eye(3, device=baseline_alphas.device, dtype=latent_alphas.dtype).unsqueeze(0)
+                latent_alphas = latent_alphas + baseline_alphas[:, None, None] * eye
+            elif latent_alphas.dim() == 4:
+                eye = torch.eye(3, device=baseline_alphas.device, dtype=latent_alphas.dtype).unsqueeze(0).unsqueeze(0)
+                latent_alphas = latent_alphas + baseline_alphas[:, None, None, None] * eye
 
 
         # compute the long-range interactions
@@ -170,14 +207,21 @@ class Les(nn.Module):
 
         if latent_alphas is not None and u_induced is not None:
             if latent_dipoles is not None:
-                if latent_dipoles.dim() == 2 and u_induced.dim() == 3:
-                    latent_dipoles = latent_dipoles.unsqueeze(1) # [n_node, 1, 3]
-                assert latent_dipoles.shape == u_induced.shape, f'latent_dipoles dimension error'
+                if latent_dipoles.dim() == 2 and u_induced.dim() == 3 and u_induced.shape[1] == 1:
+                    u_induced = u_induced.squeeze(1)
+                elif latent_dipoles.dim() == 3 and u_induced.dim() == 2:
+                    u_induced = u_induced.unsqueeze(1)
+                assert latent_dipoles.shape == u_induced.shape, 'latent_dipoles dimension error'
                 latent_dipoles = latent_dipoles + u_induced
             else:
                 latent_dipoles = u_induced
 
         if latent_kappas is not None and q_induced is not None:
+            if latent_charges.dim() == 1 and q_induced.dim() == 2 and q_induced.shape[1] == 1:
+                q_induced = q_induced.squeeze(1)
+            elif latent_charges.dim() == 2 and q_induced.dim() == 1:
+                q_induced = q_induced.unsqueeze(1)
+            assert latent_charges.shape == q_induced.shape, 'latent_charges dimension error'
             latent_charges = latent_charges + q_induced
 
         # compute the BEC
