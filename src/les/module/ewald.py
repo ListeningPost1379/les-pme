@@ -4,6 +4,8 @@ from itertools import product
 from typing import Dict, Optional, Tuple, List
 
 from les.module.make_kernels import make_kernels
+from les.module.reciprocal import reciprocal_energy
+from les.module.blocked import DEFAULT_DENSE_PAIRS, reciprocal_multipoles, real_multipoles
 
 __all__ = ['Ewald']
 
@@ -14,8 +16,22 @@ class Ewald(nn.Module):
                  remove_self_interaction=True,
                  norm_factor=90.4756,
                  use_epsilon_r_scaling=False,
+                 reciprocal_solver='direct',
+                 compute_dtype='auto',
+                 dense_pairs=DEFAULT_DENSE_PAIRS,
                  ):
         super().__init__()
+        if reciprocal_solver not in ('direct', 'original', 'blocked'):
+            raise ValueError("Ewald reciprocal_solver must be 'direct', 'original' or 'blocked'")
+        if compute_dtype not in ('auto', 'float32', 'float64'):
+            raise ValueError("compute_dtype must be 'auto', 'float32' or 'float64'")
+        if isinstance(dense_pairs, bool) or not isinstance(dense_pairs, int) or dense_pairs < 0:
+            raise ValueError("dense_pairs must be a non-negative integer")
+        self.reciprocal_solver = reciprocal_solver
+        self.compute_dtype = compute_dtype
+        # blocked/pme: graphs with at most this many pairs (or atom-mode pairs)
+        # skip recomputation; 0 always streams with bounded storage.
+        self.dense_pairs = dense_pairs
         self.dl = dl
         self.sigma = sigma
         self.sigma_sq_half = sigma ** 2 / 2.0
@@ -27,6 +43,19 @@ class Ewald(nn.Module):
         self.norm_factor = norm_factor
         self.k_sq_max = (self.twopi / self.dl) ** 2
         self.use_epsilon_r_scaling = use_epsilon_r_scaling
+
+    def __setstate__(self, state):
+        state.setdefault('reciprocal_solver', getattr(type(self), 'reciprocal_solver', 'direct'))
+        state.setdefault('compute_dtype', 'auto')
+        state.setdefault('dense_pairs', DEFAULT_DENSE_PAIRS)
+        super().__setstate__(state)
+
+    def _cast(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.compute_dtype == 'float32':
+            return tensor.float()
+        if self.compute_dtype == 'float64':
+            return tensor.double()
+        return tensor
 
     def forward(self,
                 q: torch.Tensor,  # [n_atoms, n_q] or [n_atoms]
@@ -48,13 +77,46 @@ class Ewald(nn.Module):
         if batch is None:
             batch = torch.zeros(n, dtype=torch.int64, device=r.device)
 
-        unique_batches = torch.unique(batch)  # Get unique batch indices
+        if cell is not None and cell.dim() == 3:
+            n_graphs = int(cell.shape[0])
+        elif e_ext is not None and e_ext.dim() == 2:
+            n_graphs = int(e_ext.shape[0])
+        elif batch.numel() > 0:
+            n_graphs = int(batch.max().item()) + 1
+        else:
+            n_graphs = 0
+
+        if e_ext is not None:
+            if e_ext.dim() == 1:
+                if e_ext.shape[0] != 3:
+                    raise ValueError('e_ext must have shape [3] or [batch_size, 3]')
+            elif e_ext.dim() == 2:
+                if e_ext.shape[0] != n_graphs or e_ext.shape[1] != 3:
+                    raise ValueError('e_ext must have shape [3] or [batch_size, 3]')
+            else:
+                raise ValueError('e_ext must have shape [3] or [batch_size, 3]')
+
+        if cell is None:
+            is_periodic_cpu = torch.zeros(n_graphs, dtype=torch.bool, device="cpu")
+        elif cell.dim() == 3:
+            is_periodic_cpu = (torch.abs(torch.linalg.det(cell.detach())) >= 1e-6).to(
+                device="cpu", dtype=torch.bool
+            )
+        else:
+            is_periodic_cpu = (
+                (torch.abs(torch.linalg.det(cell.detach())) >= 1e-6)
+                .to(device="cpu", dtype=torch.bool)
+                .expand(n_graphs)
+            )
 
         results: List[torch.Tensor] = []
-        q_induced_results: List[torch.Tensor] = []
-        u_induced_results: List[torch.Tensor] = []
-        for i in unique_batches.long():
+        q_induced_all: Optional[torch.Tensor] = None
+        u_induced_all: Optional[torch.Tensor] = None
+        for i in range(n_graphs):
             mask = batch == i  # Create a mask for the i-th configuration
+            if not mask.any():
+                results.append(torch.zeros(1, device=r.device, dtype=self._cast(r).dtype))
+                continue
             # Calculate the potential energy for the i-th configuration
             r_raw_now, q_now = r[mask], q[mask]
 
@@ -62,17 +124,20 @@ class Ewald(nn.Module):
             quad_now = quad[mask] if quad is not None else None
             kappa_now = kappa[mask] if kappa is not None else None
             alpha_now = alpha[mask] if alpha is not None else None
-            box_now = cell[i] if cell is not None else None # Get the box for the i-th configuration
+            box_now = (cell[i] if cell.dim() == 3 else cell) if cell is not None else None
+            field_now = e_ext
+            if e_ext is not None and e_ext.dim() == 2:
+                field_now = e_ext[i]
 
             # check if the box is periodic or not
-            if box_now is None or torch.linalg.det(box_now) < 1e-6:
+            if box_now is None or not bool(is_periodic_cpu[i].item()):
                 # the box is not periodic, we use the direct sum
                 result = self.compute_potential_realspace(r_raw=r_raw_now, q=q_now, u=u_now,
                                                           quad=quad_now,
                                                           kappa=kappa_now,
                                                           alpha=alpha_now,
                                                           compute_field=compute_field,
-                                                          e_ext=e_ext,
+                                                          e_ext=field_now,
                                                           )
             else:
                 # the box is periodic, we use the reciprocal sum
@@ -80,13 +145,24 @@ class Ewald(nn.Module):
                                                           cell_now=box_now, u=u_now, quad=quad_now,
                                                           kappa=kappa_now, alpha=alpha_now,
                                                           compute_field=compute_field,
-                                                          e_ext=e_ext,
+                                                          e_ext=field_now,
                                                           )
             results.append(result['pot'])
-            q_induced_results.append(result['q_induced'])
-            u_induced_results.append(result['u_induced'])
+            q_i = result['q_induced']
+            if q_induced_all is None:
+                q_induced_all = torch.zeros([n] + list(q_i.shape[1:]), device=q_i.device, dtype=q_i.dtype)
+            q_induced_all[mask] = q_i.to(q_induced_all.dtype)
+            u_i = result['u_induced']
+            if u_induced_all is None:
+                u_induced_all = torch.zeros([n] + list(u_i.shape[1:]), device=u_i.device, dtype=u_i.dtype)
+            u_induced_all[mask] = u_i.to(u_induced_all.dtype)
 
-        return torch.cat(results), torch.cat(q_induced_results), torch.cat(u_induced_results)
+        if q_induced_all is None:
+            q_induced_all = torch.empty((0,), device=r.device, dtype=r.dtype)
+        if u_induced_all is None:
+            u_induced_all = torch.empty((0,), device=r.device, dtype=r.dtype)
+        pot_out = torch.cat(results) if len(results) > 0 else torch.zeros(0, device=r.device, dtype=r.dtype)
+        return pot_out, q_induced_all, u_induced_all
 
     def compute_potential_realspace(self, r_raw, q,
                                     u: Optional[torch.Tensor]=None,
@@ -100,11 +176,19 @@ class Ewald(nn.Module):
         # this is 1/(4pi epsilon_0)
         norm_const = self.norm_factor / self.twopi
 
-        if q.dim() == 1:
-            one_dim_input = True
+        r_raw, q = self._cast(r_raw), self._cast(q)
+        u = self._cast(u) if u is not None else None
+        quad = self._cast(quad) if quad is not None else None
+        kappa = self._cast(kappa) if kappa is not None else None
+        alpha = self._cast(alpha) if alpha is not None else None
+        e_ext = self._cast(e_ext) if e_ext is not None else None
+
+        q_one_dim = (q.dim() == 1)
+        u_two_dim = (u.dim() == 2 and u.shape[1] == 3) if u is not None else (
+            q_one_dim and (alpha is None or alpha.dim() in (1, 3))
+        )
+        if q_one_dim:
             q = q.unsqueeze(1)
-        else:
-            one_dim_input = False
         q = q.to(r_raw.dtype)
         n_node, n_q = q.shape
         device = r_raw.device
@@ -124,6 +208,20 @@ class Ewald(nn.Module):
             if quad.dim() == 3 and quad.shape[1] == 3:
                 quad = quad.unsqueeze(1)
             assert quad.shape == (n_node, n_q, 3, 3), 'quad dimension error'
+            quad = 0.5 * (quad + quad.transpose(-1, -2))
+
+        if not torch.jit.is_scripting():
+            if self.reciprocal_solver in ('blocked', 'pme'):
+                if torch.is_autocast_enabled(r_raw.device.type):
+                    raise ValueError('blocked real-space sum requires autocast disabled')
+                pot, phi, field = real_multipoles(r_raw, q, u, quad, self.sigma, norm_const,
+                                                 compute_field or alpha is not None,
+                                                 dense_pairs=self.dense_pairs)
+                out = self._finish_multipoles(pot, phi, field, q, u, quad, kappa, alpha,
+                                             e_ext, q_one_dim, False, u_two_dim=u_two_dim)
+                if not compute_field and alpha is None:
+                    out['field'] = torch.zeros_like(field)
+                return out
 
         # f_qu/f_uu also feed the charge-induced e_field when compute_field
         # or alpha is set, so compute_u covers those cases too.
@@ -210,8 +308,8 @@ class Ewald(nn.Module):
 
         output = {
                  'pot': pot.sum().view(-1),
-                 'q_induced': q_induced.squeeze(dim=1) if one_dim_input else q_induced,
-                 'u_induced': u_induced.squeeze(dim=1) if one_dim_input else u_induced,
+                 'q_induced': q_induced.squeeze(dim=1) if q_one_dim else q_induced,
+                 'u_induced': u_induced.squeeze(dim=1) if u_two_dim else u_induced,
                  'phi': e_phi,
                  'field': e_field,
                  }
@@ -223,6 +321,39 @@ class Ewald(nn.Module):
         assert kappa.dim() == 2, 'kappa dimension error'
         q_induced = - kappa * e_phi # [n, n_q]
         return q_induced
+
+    @torch.jit.unused
+    def _finish_multipoles(self, pot, phi, field, q, u, quad, kappa, alpha,
+                          e_ext, one_dim, periodic, volume=None, u_two_dim: Optional[bool] = None):
+        """Apply original self conventions and the response to the complete source sum."""
+        if u_two_dim is None:
+            u_two_dim = one_dim
+        sign = -1 if periodic and self.remove_self_interaction else (
+            1 if not periodic and not self.remove_self_interaction else 0)
+        charge_self = self.norm_factor / (self.sigma * self.twopi**1.5)
+        if sign:
+            pot = pot + sign * charge_self * q.square().sum(0)
+            phi = phi + sign * 2 * charge_self * q
+            if u is not None:
+                dipole_self = charge_self / (3 * self.sigma**2)
+                pot = pot + sign * dipole_self * u.square().sum((0, 2))
+                field = field - sign * 2 * dipole_self * u
+            if quad is not None:
+                pot = pot + sign * charge_self / (10 * self.sigma**4) * quad.square().sum((0, 2, 3))
+        qi, ui = torch.zeros_like(q), q.new_zeros(*q.shape, 3)
+        if kappa is not None:
+            qi = self._get_induced_q(phi, kappa)
+            pot = pot + .5 * (phi * qi).sum(0)
+        if alpha is not None:
+            ui = self._get_induced_u(field, alpha, e_ext)
+            pot = pot - .5 * (field * ui).sum((0, 2))
+        output = {'pot': pot.sum().view(-1), 'phi': phi, 'field': field,
+                  'q_induced': qi.squeeze(1) if one_dim else qi,
+                  'u_induced': ui.squeeze(1) if u_two_dim else ui}
+        if periodic:
+            output['epsilon_r'] = self._get_epsilon_r(alpha, volume) if (
+                alpha is not None and self.use_epsilon_r_scaling) else q.new_ones(q.shape[1])
+        return output
 
     def _get_induced_u(self, e_field, alpha, e_ext: Optional[torch.Tensor]=None):
         if e_ext is not None:
@@ -259,12 +390,19 @@ class Ewald(nn.Module):
                                     compute_potential:bool =False,
                                     compute_field: bool=False,
                                     e_ext: Optional[torch.Tensor]=None):
+        r_raw, q, cell_now = self._cast(r_raw), self._cast(q), self._cast(cell_now)
+        u = self._cast(u) if u is not None else None
+        quad = self._cast(quad) if quad is not None else None
+        kappa = self._cast(kappa) if kappa is not None else None
+        alpha = self._cast(alpha) if alpha is not None else None
+        e_ext = self._cast(e_ext) if e_ext is not None else None
         device = r_raw.device
-        if q.dim() == 1:
-            one_dim_input = True
+        q_one_dim = (q.dim() == 1)
+        u_two_dim = (u.dim() == 2 and u.shape[1] == 3) if u is not None else (
+            q_one_dim and (alpha is None or alpha.dim() in (1, 3))
+        )
+        if q_one_dim:
             q = q.unsqueeze(1)
-        else:
-            one_dim_input = False
         n_node, n_q = q.shape
 
         # pre-allocate tensors for torchscript compatibility
@@ -283,8 +421,9 @@ class Ewald(nn.Module):
             if quad.dim() == 3 and quad.shape[1] == 3:
                 quad = quad.unsqueeze(1)
             assert quad.shape == (n_node, n_q, 3, 3), 'quad dimension error'
+            quad = 0.5 * (quad + quad.transpose(-1, -2))
 
-        volume = torch.det(cell_now)
+        volume = torch.abs(torch.det(cell_now))
         cell_inv = torch.linalg.inv(cell_now)
         G = 2 * torch.pi * cell_inv.T  # Reciprocal lattice vectors [3,3], G = 2π(M^{-1}).T
 
@@ -294,8 +433,14 @@ class Ewald(nn.Module):
             epsilon_r = torch.ones(n_q, device=device, dtype=r_raw.dtype)
 
         # max Nk for each axis
-        norms = torch.norm(cell_now, dim=1)
-        Nk = [max(1, int(n.item() / self.dl)) for n in norms]
+        norms_cpu = (torch.norm(cell_now.detach(), dim=1) / self.dl).to(
+            device="cpu", dtype=torch.int64
+        )
+        Nk = [
+            max(1, int(norms_cpu[0].item())),
+            max(1, int(norms_cpu[1].item())),
+            max(1, int(norms_cpu[2].item())),
+        ]
         n1 = torch.arange(-Nk[0], Nk[0] + 1, device=device)
         n2 = torch.arange(-Nk[1], Nk[1] + 1, device=device)
         n3 = torch.arange(-Nk[2], Nk[2] + 1, device=device)
@@ -320,6 +465,43 @@ class Ewald(nn.Module):
         kvec = kvec[hemisphere_mask]
         k_sq = k_sq[hemisphere_mask]
         factors = torch.where((nvec[hemisphere_mask] == 0).all(dim=1), 1.0, 2.0)
+        if self.compute_dtype != 'auto':
+            factors = factors.to(r_raw.dtype)
+
+        if not torch.jit.is_scripting():
+            if self.reciprocal_solver == 'blocked':
+                if (torch.is_autocast_enabled(r_raw.device.type)
+                    or (r_raw.is_cuda and r_raw.dtype == torch.float32 and torch.backends.cuda.matmul.allow_tf32)):
+                    raise ValueError('blocked requires autocast and FP32 TF32 disabled')
+                weight = factors * torch.exp(-self.sigma_sq_half * k_sq) / k_sq / volume * self.norm_factor
+                potential, field = compute_potential or kappa is not None, compute_field or alpha is not None
+                if u is None and quad is None and not potential and not field:
+                    pot = reciprocal_energy(r_raw, q, kvec, weight)
+                else:
+                    pot, e_phi, e_field = reciprocal_multipoles(r_raw, q, u, quad, kvec, weight, potential, field,
+                                                               dense_pairs=self.dense_pairs)
+                out = self._finish_multipoles(pot, e_phi, e_field, q, u, quad, kappa, alpha,
+                                             e_ext, q_one_dim, True, volume, u_two_dim=u_two_dim)
+                if not potential:
+                    out['phi'] = torch.zeros_like(e_phi)
+                if not field:
+                    out['field'] = torch.zeros_like(e_field)
+                return out
+            eligible = (u is None and quad is None and kappa is None and alpha is None
+                    and not compute_potential and not compute_field and q.dtype == r_raw.dtype
+                    and not torch.is_autocast_enabled(r_raw.device.type)
+                    and not (r_raw.is_cuda and r_raw.dtype == torch.float32
+                             and torch.backends.cuda.matmul.allow_tf32))
+            if self.reciprocal_solver != 'original' and eligible:
+                weight = factors * torch.exp(-self.sigma_sq_half * k_sq) / k_sq / volume * self.norm_factor
+                pot = reciprocal_energy(r_raw, q, kvec, weight)
+                if self.remove_self_interaction:
+                    pot = pot - q.square().sum(0) / (self.sigma * self.twopi**1.5) * self.norm_factor
+                return {'pot': pot.sum().view(-1), 'q_induced': q_induced.squeeze(1) if q_one_dim else q_induced,
+                        'u_induced': u_induced.squeeze(1) if u_two_dim else u_induced,
+                        'phi': e_phi, 'field': e_field, 'epsilon_r': epsilon_r}
+        elif self.reciprocal_solver == 'blocked':
+            raise ValueError('blocked requires eager execution; select original for TorchScript')
 
         # Compute structure factor S(k), Σq*e^(ikr)
         k_dot_r = torch.matmul(r_raw, kvec.T)  # [n, M]
@@ -338,7 +520,8 @@ class Ewald(nn.Module):
             S_k_imag = S_k_imag + S_k_imag_u
 
         if quad is not None:
-            qk2 = torch.einsum("mi,ncij,mj->ncm",kvec, quad, kvec)
+            kk = (kvec[:, :, None] * kvec[:, None, :]).reshape(kvec.shape[0], 9)
+            qk2 = (quad.reshape(n_node * n_q, 9) @ kk.T).reshape(n_node, n_q, kvec.shape[0])
             S_k_real_Q = -0.5 * (qk2 * cos_kr.unsqueeze(1)).sum(dim=0)
             S_k_real = S_k_real + S_k_real_Q
             S_k_imag_Q = -0.5 * (qk2 * sin_kr.unsqueeze(1)).sum(dim=0)
@@ -361,7 +544,7 @@ class Ewald(nn.Module):
                 pot -= torch.sum(quad**2, dim=(0,2,3)) / (10 * self.sigma**5. * self.twopi**1.5) * self.norm_factor
 
         # for computing electric field or potential
-        if compute_field or kappa is not None or alpha is not None:
+        if compute_potential or compute_field or kappa is not None or alpha is not None:
             #S_k = S_k_real + 1j * S_k_imag
             #exp_ikr = cos_k_dot_r + 1j * sin_k_dot_r
             # sk_field = 2 * kfac * torch.conj(S_k)   # [n_q, M]
@@ -405,8 +588,8 @@ class Ewald(nn.Module):
 
         output = {
                  'pot': pot.sum().view(-1), # sum over the energy contributions from different nq channels
-                 'q_induced': q_induced.squeeze(dim=1) if one_dim_input else q_induced,
-                 'u_induced': u_induced.squeeze(dim=1) if one_dim_input else u_induced,
+                 'q_induced': q_induced.squeeze(dim=1) if q_one_dim else q_induced,
+                 'u_induced': u_induced.squeeze(dim=1) if u_two_dim else u_induced,
                  'phi': e_phi,
                  'field': e_field,
                  'epsilon_r': epsilon_r,

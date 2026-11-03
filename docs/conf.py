@@ -1,9 +1,9 @@
 # Configuration file for the Sphinx documentation builder.
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
-project = "LES"
-copyright = "2026, Cheng Group"
-author = "Cheng Group"
+project = "LES-PME"
+copyright = "2026, Cheng Group (upstream LES); 2026, Dehan Cao (LES-PME extensions)"
+author = "Dehan Cao (LES-PME); Bingqing Cheng and contributors (upstream LES)"
 
 extensions = [
     "sphinx.ext.autodoc",
@@ -37,4 +37,4 @@ templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
 html_theme = "furo"
-html_title = "LES"
+html_title = "LES-PME"

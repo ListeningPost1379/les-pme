@@ -1,5 +1,15 @@
 # Citation
 
+## LES-PME extensions
+
+The LES-PME extension author and maintainer is **Dehan Cao** (<caodehan@gmail.com>). For the extension software, cite the release metadata in [CITATION.cff](../CITATION.cff):
+
+> Cao, Dehan. LES-PME: Trainable blocked and particle-mesh Ewald extensions to LES. Version 0.2.0+lespme.1 (2026). https://github.com/ListeningPost1379/les-pme
+
+This software citation identifies the extensions; it does not replace the upstream LES method citations below. No software DOI has been assigned.
+
+## Upstream LES
+
 If you use LES library in academic work, please cite:
 
 ```bibtex

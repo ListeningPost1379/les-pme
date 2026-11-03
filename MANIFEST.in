@@ -1,0 +1,6 @@
+include LICENSE.md README.md CITATION.cff
+recursive-include docs *.md *.rst *.py *.txt Makefile
+recursive-include example *.yaml
+recursive-include src/les/tests *.py
+recursive-include test *.py
+recursive-include tests *.py

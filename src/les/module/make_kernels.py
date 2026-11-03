@@ -1,7 +1,8 @@
 import torch
 from typing import Optional
 
-def make_kernels(r, sigma: float, norm_const: float, compute_u: bool=True, compute_Q: bool=True):
+def make_kernels(r, sigma: float, norm_const: float, compute_u: bool=True, compute_Q: bool=True,
+                 r_target: Optional[torch.Tensor]=None, mask_off: Optional[torch.Tensor]=None):
     """
     Compute the Ewald real-space interaction kernels.
 
@@ -20,10 +21,13 @@ def make_kernels(r, sigma: float, norm_const: float, compute_u: bool=True, compu
     sqrt_pi = torch.pi ** 0.5
     device, dtype = r.device, r.dtype
 
-    mask_off = ~torch.eye(n, dtype=torch.bool, device=device)
+    if mask_off is None:
+        mask_off = ~torch.eye(n, dtype=torch.bool, device=device)
+    target = r if r_target is None else r_target
 
-    r_ij = r.unsqueeze(0) - r.unsqueeze(1)   # r_ij[i,j] = r[j] - r[i]
-    r_ij_norm = torch.norm(r_ij, dim=-1)
+    r_ij = target.unsqueeze(0) - r.unsqueeze(1)   # r_ij[i,j] = r[j] - r[i]
+    # Exclude the diagonal before sqrt: masking norm(0) afterwards gives NaN Hessians.
+    r_ij_norm = torch.where(mask_off, r_ij.square().sum(-1), 1.).sqrt()
 
     rinv = torch.zeros_like(r_ij_norm)
     rinv[mask_off] = 1.0 / r_ij_norm[mask_off]
@@ -115,9 +119,9 @@ def bare_multipole_tensors(r):
     mask_off = ~torch.eye(n, dtype=torch.bool, device=device)
 
     r_ij = r.unsqueeze(0) - r.unsqueeze(1)
-    dist = torch.norm(r_ij, dim=-1)
-    rinv = torch.zeros_like(dist)
-    rinv[mask_off] = 1.0 / dist[mask_off]
+    # Exclude the diagonal before sqrt so gradients and Hessians are finite on i==j.
+    dist = torch.where(mask_off, r_ij.square().sum(-1), 1.0).sqrt()
+    rinv = torch.where(mask_off, 1.0 / dist, torch.zeros_like(dist))
     rinv2 = rinv * rinv
     rinv3 = rinv2 * rinv
     rinv4 = rinv3 * rinv
