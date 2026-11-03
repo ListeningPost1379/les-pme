@@ -1,4 +1,4 @@
-include LICENSE.md README.md CITATION.cff
+include LICENSE.md README.md README.zh-CN.md CITATION.cff
 recursive-include docs *.md *.rst *.py *.txt Makefile
 recursive-include example *.yaml
 recursive-include src/les/tests *.py
